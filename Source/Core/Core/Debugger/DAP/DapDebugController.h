@@ -315,6 +315,19 @@ private:
   void ApplyCodeBreakpoints(const std::vector<CodeBreakpointRequest>& breakpoints);
   void ReapplyCodeBreakpoints();
 
+
+
+  // for Windows Build
+  // Resolves a named-variable expression (a bare local/global name, or a
+  // chain of ->field / .field / [index] accessors on one) against the same
+  // DWARF-backed model that powers the Locals/Globals tree, so Watch
+  // expressions see exactly what that tree shows -- including pointers,
+  // structs, unions and arrays. Returns nullopt if the base name isn't a
+  // known local/global, or a step in the chain doesn't resolve.
+  std::optional<DebugVariable> ResolveDebugVariablePath(std::string_view expression);
+
+
+
   Core::System& m_system;
   std::map<std::string, std::vector<CodeBreakpointRequest>> m_source_breakpoints;
   std::vector<CodeBreakpointRequest> m_instruction_breakpoints;
