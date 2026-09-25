@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cctype> // for Windows Build
 #include <limits>
 #include <string>
 #include <string_view>
@@ -547,7 +548,144 @@ void DapDebugController::SetDataBreakpoints(std::vector<DataBreakpointRequest> b
   }
 }
 
-std::optional<std::string> DapDebugController::EvaluateExpression(const std::string_view expression)
+
+
+// for Windows Build
+namespace
+{
+struct PathAccessor
+{
+  enum class Kind
+  {
+    Member,
+    Index
+  } kind;
+  std::string name;  // for Member
+  u32 index = 0;     // for Index
+};
+
+// Parses "mei->match_end.player_standings[0].self_destructs" into
+// base = "mei", accessors = [Member(match_end), Member(player_standings),
+// Index(0), Member(self_destructs)]. "->" and "." are treated identically:
+// the child-walking step below already resolves pointer indirection, so the
+// expression author doesn't need to know which one a given field requires.
+std::optional<std::pair<std::string, std::vector<PathAccessor>>>
+ParseVariablePath(std::string_view expression)
+{
+  while (!expression.empty() && std::isspace(static_cast<unsigned char>(expression.front())))
+    expression.remove_prefix(1);
+  while (!expression.empty() && std::isspace(static_cast<unsigned char>(expression.back())))
+    expression.remove_suffix(1);
+  if (expression.empty())
+    return std::nullopt;
+
+  const auto is_ident_char = [](char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
+  };
+
+  if (!std::isalpha(static_cast<unsigned char>(expression[0])) && expression[0] != '_')
+    return std::nullopt;  // doesn't start like an identifier -- let the numeric evaluator try it
+
+  std::size_t pos = 0;
+  std::size_t start = pos;
+  while (pos < expression.size() && is_ident_char(expression[pos]))
+    ++pos;
+  std::string base(expression.substr(start, pos - start));
+
+  std::vector<PathAccessor> accessors;
+  while (pos < expression.size())
+  {
+    if (expression[pos] == '.' || expression.compare(pos, 2, "->") == 0)
+    {
+      pos += (expression[pos] == '.') ? 1 : 2;
+      start = pos;
+      while (pos < expression.size() && is_ident_char(expression[pos]))
+        ++pos;
+      if (pos == start)
+        return std::nullopt;  // malformed, e.g. trailing "."
+      accessors.push_back(
+          {PathAccessor::Kind::Member, std::string(expression.substr(start, pos - start)), 0});
+    }
+    else if (expression[pos] == '[')
+    {
+      ++pos;
+      start = pos;
+      while (pos < expression.size() && std::isdigit(static_cast<unsigned char>(expression[pos])))
+        ++pos;
+      if (pos == start || pos >= expression.size() || expression[pos] != ']')
+        return std::nullopt;  // malformed index
+      const u32 index =
+          static_cast<u32>(std::stoul(std::string(expression.substr(start, pos - start))));
+      ++pos;  // consume ']'
+      accessors.push_back({PathAccessor::Kind::Index, "", index});
+    }
+    else
+    {
+      return std::nullopt;  // e.g. an operator -- not a variable-path expression at all
+    }
+  }
+
+  return std::make_pair(std::move(base), std::move(accessors));
+}
+}  // namespace
+
+std::optional<DebugVariable>
+DapDebugController::ResolveDebugVariablePath(const std::string_view expression)
+{
+  const auto parsed = ParseVariablePath(expression);
+  if (!parsed)
+    return std::nullopt;
+  const auto& [base_name, accessors] = *parsed;
+
+  std::optional<DebugVariable> current;
+  for (const bool globals : {false, true})
+  {
+    for (DebugVariable& candidate : GetDebugVariables(globals))
+    {
+      if (candidate.name == base_name)
+      {
+        current = std::move(candidate);
+        break;
+      }
+    }
+    if (current)
+      break;
+  }
+  if (!current)
+    return std::nullopt;
+
+  // Expands one level of `parent`'s children, transparently skipping any
+  // synthetic single-"*" dereference node (one per pointer layer) so callers
+  // can write `mei->field` without knowing how many pointer indirections
+  // `mei` actually has -- matching what the Locals tree already shows.
+  const auto expand = [this](DebugVariable& parent) -> std::vector<DebugVariable> {
+    if (!parent.children)
+      return {};
+    std::vector<DebugVariable> children = GetDebugVariableChildren(*parent.children);
+    while (children.size() == 1 && children.front().name == "*" && children.front().children)
+      children = GetDebugVariableChildren(*children.front().children);
+    return children;
+  };
+
+  for (const PathAccessor& accessor : accessors)
+  {
+    std::vector<DebugVariable> children = expand(*current);
+    const std::string target = accessor.kind == PathAccessor::Kind::Member ?
+                                   accessor.name :
+                                   fmt::format("[{}]", accessor.index);
+
+    auto it = std::ranges::find(children, target, &DebugVariable::name);
+    if (it == children.end())
+      return std::nullopt;
+    current = std::move(*it);
+  }
+
+  return current;
+}
+
+
+
+/*std::optional<std::string> DapDebugController::EvaluateExpression(const std::string_view expression)
 {
   const std::optional<Expression> parsed = Expression::TryParse(expression);
   if (!parsed)
@@ -559,7 +697,34 @@ std::optional<std::string> DapDebugController::EvaluateExpression(const std::str
     return fmt::format("0x{:08x}", static_cast<u32>(value));
 
   return fmt::format("{}", value);
+}*/
+
+
+
+// for Windows Build
+std::optional<std::string> DapDebugController::EvaluateExpression(const std::string_view expression)
+{
+  // Try resolving as a named local/global (optionally chained with
+  // ->field / .field / [index]) against the same DWARF model backing the
+  // Locals/Globals tree, before falling back to raw register/memory
+  // arithmetic. This lets Watch expressions like `mei->match_end.x20`
+  // resolve identically to what Locals already shows.
+  if (const std::optional<DebugVariable> resolved = ResolveDebugVariablePath(expression))
+    return resolved->value;
+
+  const std::optional<Expression> parsed = Expression::TryParse(expression);
+  if (!parsed)
+    return std::nullopt;
+
+  Core::CPUThreadGuard guard(m_system);
+  const double value = parsed->Evaluate(m_system);
+  if (value == std::trunc(value) && value >= 0 && value <= 0xffffffff)
+    return fmt::format("0x{:08x}", static_cast<u32>(value));
+
+  return fmt::format("{}", value);
 }
+
+
 
 RegisterSnapshot DapDebugController::GetRegisters()
 {
